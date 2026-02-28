@@ -1,4 +1,7 @@
 //***************************************************
+// Differential Thrust Flight Controller (Access Point Mode)
+//***************************************************
+
 #include <ESP8266WiFi.h>
 #include <WiFiUdp.h>
 
@@ -6,8 +9,9 @@
 #define ST_LED  2
 #define L_MOTOR 5
 #define R_MOTOR 4
-#define DC_RSSI 1500  // Time in mS for send RSSI
-#define DC_RX   900   // Time in mS for tx inactivity (Failsafe Timeout)
+
+#define DC_RSSI 1500  // Time in mS for sending telemetry
+#define DC_RX   900   // Time in mS for tx inactivity (App timeout Failsafe)
 
 ADC_MODE(ADC_VCC);
 
@@ -15,13 +19,12 @@ ADC_MODE(ADC_VCC);
 unsigned long premillis_rssi = 0;
 unsigned long premillis_rx   = 0;
 bool motors_active = false;
-bool wifi_was_connected = false;
+bool app_was_connected = false;
 
-char ssid[] = "wifiplane";        // your network SSID (name)
-char pass[] = "wifiplane1234";    // your network password 
-IPAddress remotIp;
+// Network variables
 unsigned int localPort = 6000;    // local port to listen on
 unsigned int remotPort = 2390;    // local port to talk on
+IPAddress remotIp;                // Will be set to broadcast IP
 
 char packetBuffer[32]; 
 char replyBuffer[]={P_ID,0x01,0x01,0x00}; // telemetry payload
@@ -32,7 +35,9 @@ void setup() {
   delay(10);
   Serial.println("\n\n--- Differential Thrust Flight Controller ---");
   
-  WiFi.mode(WIFI_STA);
+  // ==========================================
+  // HARDWARE SETUP
+  // ==========================================
   analogWriteRange(255);
   
   pinMode(L_MOTOR, OUTPUT);
@@ -41,58 +46,83 @@ void setup() {
   analogWrite(R_MOTOR, 0);
   
   pinMode(ST_LED, OUTPUT);
-  digitalWrite(ST_LED, HIGH);
+  digitalWrite(ST_LED, HIGH); // Turn LED off initially (assuming active-LOW)
+
+  // ==========================================
+  // DYNAMIC ACCESS POINT SETUP
+  // ==========================================
+  Serial.println("Configuring Access Point...");
   
-  Serial.print("Connecting to Hotspot: ");
-  Serial.println(ssid);
+  // 1. Set ESP8266 to Access Point mode
+  WiFi.mode(WIFI_AP);
   
-  WiFi.begin(ssid, pass);
-  while (WiFi.status() != WL_CONNECTED) 
-  {
-    digitalWrite(ST_LED, LOW);
-    delay(60);
-    digitalWrite(ST_LED, HIGH);
-    delay(1000);
-    Serial.print(".");
-  }
+  // 2. Fetch the unique MAC address of this specific chip
+  uint8_t mac[6];
+  WiFi.softAPmacAddress(mac);
   
-  wifi_was_connected = true;
-  Serial.println("\nWiFi Connected!");
-  Serial.print("Assigned IP Address: ");
-  Serial.println(WiFi.localIP());
+  // 3. Generate a unique network name (e.g., "Plane_A1B2")
+  char dynamic_ssid[20];
+  sprintf(dynamic_ssid, "Plane_%02X%02X", mac[4], mac[5]); 
   
-  remotIp = WiFi.localIP();
-  remotIp[3] = 255; 
+  // 4. Start the hotspot with an open network (no password)
+  WiFi.softAP(dynamic_ssid, ""); 
+  
+  Serial.print("Access Point Started! Connect phone to: ");
+  Serial.println(dynamic_ssid);
+  
+  // In AP Mode, the ESP's IP address is always 192.168.4.1
+  Serial.print("ESP IP Address: ");
+  Serial.println(WiFi.softAPIP()); 
+
+  // ==========================================
+  // UDP & NETWORK CONFIGURATION
+  // ==========================================
+  // Set the telemetry to broadcast to any device connected to the plane's network
+  remotIp = IPAddress(192, 168, 4, 255); 
+  
   Udp.begin(localPort);
+  Serial.print("Listening for App Control Data on UDP Port: ");
+  Serial.println(localPort);
+  
+  // Turn LED on to indicate the system is fully ready
+  digitalWrite(ST_LED, LOW); 
+  
   Serial.println("System Ready. Waiting for App Data...");
   Serial.println("----------------------------------------");
 }
 
 void loop() {
-  delay(5);
+  delay(5); // Critical for ESP8266 background Wi-Fi tasks
   
   // ==========================================
-  // LAYER 1: WI-FI RANGE FAILSAFE
+  // LAYER 1: WI-FI RANGE FAILSAFE (AP MODE)
   // ==========================================
-  if(WiFi.status() == WL_CONNECTED)
+  // In AP mode, we check how many devices (stations) are connected to the ESP.
+  // If it's greater than 0, a phone is connected to the plane.
+  int clients_connected = WiFi.softAPgetStationNum();
+  
+  if(clients_connected > 0)
   {
-    if (!wifi_was_connected) {
-      Serial.println("SUCCESS: WiFi Reconnected!");
-      wifi_was_connected = true;
+    if (!app_was_connected) {
+      Serial.println("SUCCESS: Phone Connected to Plane!");
+      app_was_connected = true;
     }
     
-    digitalWrite(ST_LED, LOW);
-    int packetSize = Udp.parsePacket();
+    digitalWrite(ST_LED, LOW); // Solid LED means connected
     
     // ==========================================
     // DATA PARSING & MIXING ALGORITHM
     // ==========================================
+    int packetSize = Udp.parsePacket();
     if (packetSize) 
     {
       int len = Udp.read(packetBuffer, 31);
       if (len > 0) 
       {
         packetBuffer[len] = '\0'; 
+
+        Serial.print("Received Data: ");
+        Serial.println(packetBuffer);
         
         int parsed_pid, parsed_throttle, parsed_yaw;
         int parsed_count = sscanf(packetBuffer, "[%d, %d, %d]", &parsed_pid, &parsed_throttle, &parsed_yaw);
@@ -111,16 +141,14 @@ void loop() {
           // 3. Apply Differential Thrust (Slowing the inner motor)
           if (parsed_yaw < 64) {
             // Turning Left: Slow down the Left Motor proportionally
-            // Example: Yaw 0 = 0% speed. Yaw 32 = 50% speed.
             out_l = (base_speed * parsed_yaw) / 64;
           } 
           else if (parsed_yaw > 64) {
             // Turning Right: Slow down the Right Motor proportionally
-            // Example: Yaw 128 = 0% speed. Yaw 96 = 50% speed.
             out_r = (base_speed * (128 - parsed_yaw)) / 64;
           }
 
-          // Constrain final outputs just to be absolutely safe
+          // Constrain final outputs
           out_l = constrain(out_l, 0, 255);
           out_r = constrain(out_r, 0, 255);
 
@@ -131,18 +159,22 @@ void loop() {
           motors_active = true;
           premillis_rx = millis(); // Reset the data failsafe timer
 
-          // DEBUG: Print the mixing results
+          // Uncomment below to debug mixing results in real-time
+          /*
           Serial.print("APP -> Thr: "); Serial.print(parsed_throttle);
           Serial.print(" | Yaw: "); Serial.print(parsed_yaw);
           Serial.print("  ||  MOTORS -> L: "); Serial.print(out_l);
           Serial.print(" | R: "); Serial.println(out_r);
+          */
         }
       }
     }
     
     // ==========================================
-    // LAYER 2: APP DISCONNECT / TIMEOUT FAILSAFE
+    // LAYER 2: APP TIMEOUT FAILSAFE
     // ==========================================
+    // Even if the phone is connected to Wi-Fi, the app might have crashed or minimized.
+    // If no UDP data is received for 900ms, kill the motors.
     if(millis() - premillis_rx > DC_RX)
     {
        if (motors_active) {
@@ -159,30 +191,34 @@ void loop() {
     if(millis() - premillis_rssi > DC_RSSI)
     {
        premillis_rssi = millis();
-       long rssi = abs(WiFi.RSSI());
-       float vcc = (((float)ESP.getVcc()/(float)1024.0)+0.75f)*10;
-       replyBuffer[1] = (unsigned char)rssi;
-       replyBuffer[2] = (unsigned char)vcc;
        
+       // Measure the internal voltage
+       float vcc = (((float)ESP.getVcc()/(float)1024.0)+0.75f);
+       
+       // Convert the float to a pure string, e.g., "3.85"
+       char telemetryStr[10];
+       sprintf(telemetryStr, "%.2f", vcc);
+       
+       // Send to App
        Udp.beginPacket(remotIp, remotPort);
-       Udp.write(replyBuffer);
+       Udp.write(telemetryStr); 
        Udp.endPacket();
      }
   }
   else
   {
     // ==========================================
-    // OUT OF RANGE BEHAVIOR
+    // NO PHONE CONNECTED BEHAVIOR
     // ==========================================
-    if (wifi_was_connected || motors_active) {
+    if (app_was_connected || motors_active) {
       analogWrite(L_MOTOR, 0);
       analogWrite(R_MOTOR, 0);
       motors_active = false;
-      wifi_was_connected = false;
-      Serial.println("!!! CRITICAL FAILSAFE: Wi-Fi Connection Lost! Motors STOPPED. !!!");
+      app_was_connected = false;
+      Serial.println("!!! CRITICAL FAILSAFE: Phone Disconnected! Motors STOPPED. !!!");
     }
     
-    // Blink LED to indicate we are trying to reconnect
+    // Blink LED to indicate waiting for connection
     digitalWrite(ST_LED, LOW);
     delay(60);
     digitalWrite(ST_LED, HIGH);
