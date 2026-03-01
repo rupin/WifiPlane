@@ -138,6 +138,8 @@ void loop() {
           int out_l = base_speed;
           int out_r = base_speed;
 
+          parsed_yaw = constrain(parsed_yaw, 0, 128);          
+
           // 3. Apply Differential Thrust (Slowing the inner motor)
           if (parsed_yaw < 64) {
             // Turning Left: Slow down the Left Motor proportionally
